@@ -26,6 +26,10 @@ BUSINESS_EMAIL = os.getenv("BUSINESS_EMAIL", GMAIL_USER)
 
 DB_PATH = os.getenv("DB_PATH", "./hdfc_payments.db")
 SEARCH_DAYS = max(1, int(os.getenv("SEARCH_DAYS", "10")))
+# NEW: How far back to scan on first run / backfill (0 = unlimited/all mail)
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "0"))
+# NEW: Max emails to scan per backfill batch (prevents memory issues)
+BACKFILL_BATCH = max(100, int(os.getenv("BACKFILL_BATCH", "2000")))
 POLL_INTERVAL = max(3, int(os.getenv("POLL_INTERVAL", "5")))
 HDFC_EMAIL_FROM = os.getenv("HDFC_EMAIL_FROM", "").strip().lower()
 VERIFY_INCOMING_ONLY = os.getenv("VERIFY_INCOMING_ONLY", "true").lower() in {
@@ -49,6 +53,7 @@ collector_total_scanned = 0
 collector_total_saved = 0
 collector_total_rejected = 0
 collector_mailbox = ""
+collector_backfill_done = False
 
 collector_thread = None
 collector_stop_event = threading.Event()
@@ -125,6 +130,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_received ON payments(received_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_message_id ON payments(message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_direction ON payments(direction)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_email_uid ON payments(email_uid)")
         conn.commit()
 
 
@@ -341,6 +347,7 @@ class HDFCBankEmailCollector:
             "@hdfcbank.net" in sender
             or "@hdfc.bank.in" in sender
             or "@hdfcbank.com" in sender
+            or "@hdfcbank.bank.in" in sender
         )
 
     @classmethod
@@ -510,6 +517,7 @@ class HDFCBankEmailCollector:
             return False
 
     def search_since(self):
+        """Search emails since SEARCH_DAYS ago (for incremental live polling)."""
         since_date = (
             datetime.now() - timedelta(days=SEARCH_DAYS + 1)
         ).strftime("%d-%b-%Y")
@@ -524,14 +532,118 @@ class HDFCBankEmailCollector:
             raise RuntimeError("Gmail history search failed")
         return data[0].split()
 
-    def initial_backfill(self):
-        global collector_last_uid, collector_total_scanned, collector_total_saved
+    def search_all(self, since_date=None):
+        """
+        Search ALL emails (or since given date) from HDFC sender.
+        Used for full backfill of older payments.
+        """
+        if since_date:
+            if HDFC_EMAIL_FROM:
+                query = f'(FROM "{HDFC_EMAIL_FROM}" SINCE "{since_date}")'
+            else:
+                query = f'(SINCE "{since_date}")'
+        else:
+            # Unlimited: all mail from HDFC sender
+            if HDFC_EMAIL_FROM:
+                query = f'(FROM "{HDFC_EMAIL_FROM}")'
+            else:
+                query = "ALL"
+
+        status, data = self.mail.search(None, query)
+        if status != "OK":
+            raise RuntimeError("Gmail full search failed")
+        return data[0].split()
+
+    def full_backfill(self, since_date=None):
+        """
+        Scan ALL older HDFC emails (beyond SEARCH_DAYS window).
+        This is the KEY fix for scanning older payments.
+
+        Args:
+            since_date: Optional IMAP date string (e.g. "01-Jan-2020").
+                       If None, scans ALL HDFC emails (unlimited).
+
+        Returns:
+            Number of new payments saved.
+        """
+        global collector_total_scanned, collector_total_saved
         self.ensure_connection()
+
+        email_ids = self.search_all(since_date)
+        total = len(email_ids)
+
+        if total == 0:
+            print("[Collector] Full backfill: no emails found")
+            return 0
+
+        print(f"[Collector] Full backfill: {total} emails found in {self.mailbox}")
+
+        saved_count = 0
+        processed = 0
+
+        # Process in batches to avoid memory issues
+        for raw_uid in email_ids:
+            try:
+                uid = int(raw_uid)
+            except Exception:
+                continue
+
+            processed += 1
+            collector_total_scanned += 1
+
+            if self.process_uid(uid):
+                collector_total_saved += 1
+                saved_count += 1
+
+            # Progress log every 100 emails
+            if processed % 100 == 0:
+                print(f"[Collector] Backfill progress: {processed}/{total} "
+                      f"(saved: {saved_count})")
+
+        print(f"[Collector] Full backfill complete. "
+              f"Processed: {processed}, New saved: {saved_count}, "
+              f"DB total: {self.get_payment_count()}")
+        return saved_count
+
+    def initial_backfill(self):
+        """
+        Initial backfill: scan recent emails since SEARCH_DAYS ago.
+        Also detects if a FULL backfill is needed for older emails.
+        """
+        global collector_last_uid, collector_total_scanned, collector_total_saved
+        global collector_backfill_done
+
+        self.ensure_connection()
+
+        # Step 1: Full backfill of ALL older HDFC emails (the fix!)
+        backfill_key = "full_backfill_done"
+        already_done = get_state(backfill_key, "false") == "true"
+
+        if not already_done:
+            print("[Collector] Starting FULL backfill of older HDFC emails...")
+
+            if BACKFILL_DAYS > 0:
+                since_date = (
+                    datetime.now() - timedelta(days=BACKFILL_DAYS)
+                ).strftime("%d-%b-%Y")
+                print(f"[Collector] Scanning emails since {since_date} "
+                      f"({BACKFILL_DAYS} days back)")
+                self.full_backfill(since_date=since_date)
+            else:
+                print("[Collector] Scanning ALL HDFC emails (unlimited backfill)")
+                self.full_backfill(since_date=None)
+
+            set_state(backfill_key, "true")
+            collector_backfill_done = True
+        else:
+            print("[Collector] Full backfill already done previously")
+
+        # Step 2: Recent backfill (last SEARCH_DAYS) to catch anything missed
         email_ids = self.search_since()
+        print(f"[Collector] Recent backfill: {len(email_ids)} emails found "
+              f"in last {SEARCH_DAYS} days")
 
-        print(f"[Collector] Backfill: {len(email_ids)} emails found in {self.mailbox}")
         highest_uid = 0
-
         for raw_uid in email_ids:
             try:
                 uid = int(raw_uid)
@@ -542,11 +654,13 @@ class HDFCBankEmailCollector:
             if self.process_uid(uid):
                 collector_total_saved += 1
 
+        # Update last_uid to the highest found
         if highest_uid:
             collector_last_uid = highest_uid
             set_state("last_uid", highest_uid)
 
-        print(f"[Collector] Backfill complete. DB payments: {self.get_payment_count()}")
+        print(f"[Collector] Initial backfill complete. "
+              f"DB payments: {self.get_payment_count()}")
 
     def fetch_new_emails(self):
         global collector_last_uid, collector_total_scanned, collector_total_saved
@@ -646,7 +760,7 @@ def collector_worker():
 
 app = FastAPI(
     title="HDFC Bank UPI UTR Verification API",
-    version="2.0.0",
+    version="2.1.0",
     description="HDFC email based UPI transaction collector and UTR verifier.",
 )
 
@@ -1031,6 +1145,8 @@ async def health():
         "collector_running": collector_running,
         "stored_payments": row["count"],
         "history_scan_days": SEARCH_DAYS,
+        "backfill_days": BACKFILL_DAYS,
+        "backfill_done": collector_backfill_done,
         "poll_interval_seconds": POLL_INTERVAL,
         "mailbox": collector_mailbox,
         "db_path": DB_PATH,
@@ -1062,6 +1178,8 @@ async def collector_status():
         "credit_records": row["credits"] or 0,
         "debit_records": row["debits"] or 0,
         "history_scan_days": SEARCH_DAYS,
+        "backfill_days": BACKFILL_DAYS,
+        "backfill_done": collector_backfill_done,
         "poll_interval_seconds": POLL_INTERVAL,
         "mailbox": collector_mailbox,
         "history_retention": "forever",
@@ -1074,6 +1192,52 @@ async def collector_refresh():
         saved = collector.run_cycle()
         return {
             "success": True,
+            "new_payments_saved": saved,
+            "stored_payments": collector.get_payment_count(),
+        }
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@app.post("/collector/backfill")
+async def collector_backfill(
+    days: int = None,
+    reset: bool = False,
+):
+    """
+    Manually trigger a full backfill of older HDFC emails.
+
+    Query params:
+        days  - Scan emails from last N days (default: BACKFILL_DAYS env or all)
+        reset - If true, clears the 'full_backfill_done' flag and rescans everything
+
+    Example:
+        POST /collector/backfill?days=365
+        POST /collector/backfill?reset=true
+    """
+    global collector_backfill_done
+    try:
+        if reset:
+            set_state("full_backfill_done", "false")
+
+        collector.ensure_connection()
+
+        if days is not None and days > 0:
+            since_date = (
+                datetime.now() - timedelta(days=days)
+            ).strftime("%d-%b-%Y")
+            saved = collector.full_backfill(since_date=since_date)
+            scanned_range = f"last {days} days"
+        else:
+            saved = collector.full_backfill(since_date=None)
+            scanned_range = "all emails"
+
+        set_state("full_backfill_done", "true")
+        collector_backfill_done = True
+
+        return {
+            "success": True,
+            "scanned_range": scanned_range,
             "new_payments_saved": saved,
             "stored_payments": collector.get_payment_count(),
         }
