@@ -2,7 +2,7 @@ Made By Gaurav Beniwal For Followers
 
 make a app password from the gmail on which bank notifications of payment comes - https://myaccount.google.com/apppasswords
 
-start command - Python hdfc_upi_verifier.py
+start command - uvicorn hdfc_upi_verifier:app --host 0.0.0.0 --port $PORT
 
 environment variables :
 GMAIL_USER - gmail 
