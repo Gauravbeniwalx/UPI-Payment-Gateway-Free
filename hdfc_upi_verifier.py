@@ -17,6 +17,9 @@ from fastapi.responses import Response, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
 GMAIL_USER = os.getenv("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 
@@ -26,10 +29,7 @@ BUSINESS_EMAIL = os.getenv("BUSINESS_EMAIL", GMAIL_USER)
 
 DB_PATH = os.getenv("DB_PATH", "./hdfc_payments.db")
 SEARCH_DAYS = max(1, int(os.getenv("SEARCH_DAYS", "10")))
-# NEW: How far back to scan on first run / backfill (0 = unlimited/all mail)
-BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "0"))
-# NEW: Max emails to scan per backfill batch (prevents memory issues)
-BACKFILL_BATCH = max(100, int(os.getenv("BACKFILL_BATCH", "2000")))
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "0"))   # 0 = ALL emails
 POLL_INTERVAL = max(3, int(os.getenv("POLL_INTERVAL", "5")))
 HDFC_EMAIL_FROM = os.getenv("HDFC_EMAIL_FROM", "").strip().lower()
 VERIFY_INCOMING_ONLY = os.getenv("VERIFY_INCOMING_ONLY", "true").lower() in {
@@ -43,6 +43,10 @@ if not UPI_ID or "@" not in UPI_ID:
 if not PAYEE_NAME.strip():
     raise RuntimeError("PAYEE_NAME cannot be empty")
 
+
+# ─────────────────────────────────────────────────────────────
+# GLOBAL STATE
+# ─────────────────────────────────────────────────────────────
 collector_running = False
 collector_started_at = None
 collector_last_check = None
@@ -202,6 +206,9 @@ def save_payment(
         return True
 
 
+# ─────────────────────────────────────────────────────────────
+# COLLECTOR
+# ─────────────────────────────────────────────────────────────
 class HDFCBankEmailCollector:
     def __init__(self, gmail_user, app_password):
         self.gmail_user = gmail_user
@@ -383,10 +390,16 @@ class HDFCBankEmailCollector:
 
     @staticmethod
     def parse_utr(text):
+        """
+        UPI Reference No. को UTR माना जाता है (HDFC emails में यही unique hota hai).
+        """
         labelled_patterns = [
+            # Priority 1: UPI Reference No. (HDFC का actual field)
+            r"UPI\s+REFERENCE\s+(?:NO|NUMBER)\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"UPI\s+REF(?:ERENCE)?\.?\s*(?:NO|NUMBER)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            # Priority 2: अन्य labelled fields
             r"UPI\s+TRANSACTION\s+REFERENCE\s+(?:NO|NUMBER)\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
             r"UPI\s+TRANSACTION\s+REF(?:ERENCE)?\.?\s*(?:NO|NUMBER)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
-            r"UPI\s*(?:REF|REFERENCE)\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
             r"TRANSACTION\s*(?:ID|REFERENCE|REF)\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
             r"\bUTR\b\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
             r"\bREFERENCE\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
@@ -400,6 +413,7 @@ class HDFCBankEmailCollector:
                 if 8 <= len(candidate) <= 30:
                     return candidate
 
+        # Fallback: UPI email में कोई 10-18 digit numeric reference
         if re.search(r"\bUPI\b", text, re.I):
             numeric = re.findall(r"\b\d{10,18}\b", text)
             if numeric:
@@ -439,20 +453,40 @@ class HDFCBankEmailCollector:
 
     @staticmethod
     def parse_direction(text):
-        t = text.lower()
-        if re.search(r"\b(?:is|has been|was)\s+credited\b", t):
+        """
+        FIXED: 'has been successfully credited' जैसे flexible phrases handle करता है.
+        """
+        t = (text or "").lower()
+
+        # Flexible regex — 'credited'/'debited' से पहले 0-40 chars allowed
+        if re.search(r"\b(?:is|has been|was|have been|were)\b.{0,40}?\bcredited\b", t):
             return "CREDIT"
-        if re.search(r"\b(?:is|has been|was)\s+debited\b", t):
+        if re.search(r"\b(?:is|has been|was|have been|were)\b.{0,40}?\bdebited\b", t):
             return "DEBIT"
-        if any(x in t for x in (
+
+        # Keyword-based fallback
+        credit_keywords = (
             "amount credited", "account credited", "a/c credited",
             "ac credited", "upi payment received", "payment received",
-        )):
-            return "CREDIT"
-        if any(x in t for x in (
+            "successfully credited", "credited to your", "credited to a/c",
+            "credited to account", "money credited", "funds credited",
+        )
+        debit_keywords = (
             "amount debited", "account debited", "a/c debited", "ac debited",
-        )):
+            "successfully debited", "debited from your", "debited from a/c",
+            "debited from account", "money debited", "funds debited",
+        )
+        if any(x in t for x in credit_keywords):
+            return "CREDIT"
+        if any(x in t for x in debit_keywords):
             return "DEBIT"
+
+        # सबसे आखिरी fallback — अगर सिर्फ 'credited'/'debited' शब्द हो
+        if re.search(r"\bcredited\b", t):
+            return "CREDIT"
+        if re.search(r"\bdebited\b", t):
+            return "DEBIT"
+
         return "UNKNOWN"
 
     @classmethod
@@ -517,7 +551,6 @@ class HDFCBankEmailCollector:
             return False
 
     def search_since(self):
-        """Search emails since SEARCH_DAYS ago (for incremental live polling)."""
         since_date = (
             datetime.now() - timedelta(days=SEARCH_DAYS + 1)
         ).strftime("%d-%b-%Y")
@@ -533,17 +566,12 @@ class HDFCBankEmailCollector:
         return data[0].split()
 
     def search_all(self, since_date=None):
-        """
-        Search ALL emails (or since given date) from HDFC sender.
-        Used for full backfill of older payments.
-        """
         if since_date:
             if HDFC_EMAIL_FROM:
                 query = f'(FROM "{HDFC_EMAIL_FROM}" SINCE "{since_date}")'
             else:
                 query = f'(SINCE "{since_date}")'
         else:
-            # Unlimited: all mail from HDFC sender
             if HDFC_EMAIL_FROM:
                 query = f'(FROM "{HDFC_EMAIL_FROM}")'
             else:
@@ -555,17 +583,6 @@ class HDFCBankEmailCollector:
         return data[0].split()
 
     def full_backfill(self, since_date=None):
-        """
-        Scan ALL older HDFC emails (beyond SEARCH_DAYS window).
-        This is the KEY fix for scanning older payments.
-
-        Args:
-            since_date: Optional IMAP date string (e.g. "01-Jan-2020").
-                       If None, scans ALL HDFC emails (unlimited).
-
-        Returns:
-            Number of new payments saved.
-        """
         global collector_total_scanned, collector_total_saved
         self.ensure_connection()
 
@@ -581,7 +598,6 @@ class HDFCBankEmailCollector:
         saved_count = 0
         processed = 0
 
-        # Process in batches to avoid memory issues
         for raw_uid in email_ids:
             try:
                 uid = int(raw_uid)
@@ -595,7 +611,6 @@ class HDFCBankEmailCollector:
                 collector_total_saved += 1
                 saved_count += 1
 
-            # Progress log every 100 emails
             if processed % 100 == 0:
                 print(f"[Collector] Backfill progress: {processed}/{total} "
                       f"(saved: {saved_count})")
@@ -606,16 +621,11 @@ class HDFCBankEmailCollector:
         return saved_count
 
     def initial_backfill(self):
-        """
-        Initial backfill: scan recent emails since SEARCH_DAYS ago.
-        Also detects if a FULL backfill is needed for older emails.
-        """
         global collector_last_uid, collector_total_scanned, collector_total_saved
         global collector_backfill_done
 
         self.ensure_connection()
 
-        # Step 1: Full backfill of ALL older HDFC emails (the fix!)
         backfill_key = "full_backfill_done"
         already_done = get_state(backfill_key, "false") == "true"
 
@@ -638,7 +648,6 @@ class HDFCBankEmailCollector:
         else:
             print("[Collector] Full backfill already done previously")
 
-        # Step 2: Recent backfill (last SEARCH_DAYS) to catch anything missed
         email_ids = self.search_since()
         print(f"[Collector] Recent backfill: {len(email_ids)} emails found "
               f"in last {SEARCH_DAYS} days")
@@ -654,7 +663,6 @@ class HDFCBankEmailCollector:
             if self.process_uid(uid):
                 collector_total_saved += 1
 
-        # Update last_uid to the highest found
         if highest_uid:
             collector_last_uid = highest_uid
             set_state("last_uid", highest_uid)
@@ -758,9 +766,12 @@ def collector_worker():
         print("[Collector] Worker stopped")
 
 
+# ─────────────────────────────────────────────────────────────
+# FASTAPI APP
+# ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="HDFC Bank UPI UTR Verification API",
-    version="2.1.0",
+    version="2.2.0",
     description="HDFC email based UPI transaction collector and UTR verifier.",
 )
 
@@ -1205,15 +1216,11 @@ async def collector_backfill(
     reset: bool = False,
 ):
     """
-    Manually trigger a full backfill of older HDFC emails.
+    पुराने HDFC emails को दोबारा scan करें.
 
     Query params:
-        days  - Scan emails from last N days (default: BACKFILL_DAYS env or all)
-        reset - If true, clears the 'full_backfill_done' flag and rescans everything
-
-    Example:
-        POST /collector/backfill?days=365
-        POST /collector/backfill?reset=true
+        days  - last N days scan करें (default: BACKFILL_DAYS env या ALL)
+        reset - true करने पर 'full_backfill_done' flag clear होगा और सब दोबारा scan होगा
     """
     global collector_backfill_done
     try:
@@ -1243,6 +1250,61 @@ async def collector_backfill(
         }
     except Exception as exc:
         return {"success": False, "error": str(exc)}
+
+
+# ─────────────────────────────────────────────────────────────
+# ONE-TIME FIX ENDPOINT — पुराने records की direction ठीक करें
+# ─────────────────────────────────────────────────────────────
+@app.post("/admin/fix-directions")
+async def fix_directions():
+    """
+    DB में जो records गलत direction (UNKNOWN/DEBIT) के साथ save हुए हैं,
+    उन्हें subject + note + sender_name के आधार पर दोबारा detect करके update करता है.
+    एक बार चलाएँ, फिर भूल जाएँ.
+    """
+    fixed = 0
+    total = 0
+
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT id, subject, note, sender_name, direction
+            FROM payments
+        """).fetchall()
+        total = len(rows)
+
+        for row in rows:
+            combined = " ".join(filter(None, [
+                row["subject"] or "",
+                row["note"] or "",
+                row["sender_name"] or "",
+            ]))
+            new_dir = HDFCBankEmailCollector.parse_direction(combined)
+
+            if new_dir != row["direction"]:
+                conn.execute(
+                    "UPDATE payments SET direction = ? WHERE id = ?",
+                    (new_dir, row["id"])
+                )
+                fixed += 1
+
+        conn.commit()
+
+        stats = conn.execute("""
+            SELECT
+                SUM(CASE WHEN direction='CREDIT'  THEN 1 ELSE 0 END) AS credits,
+                SUM(CASE WHEN direction='DEBIT'   THEN 1 ELSE 0 END) AS debits,
+                SUM(CASE WHEN direction='UNKNOWN' THEN 1 ELSE 0 END) AS unknown
+            FROM payments
+        """).fetchone()
+
+    return {
+        "success": True,
+        "total_records": total,
+        "fixed_records": fixed,
+        "credits": stats["credits"] or 0,
+        "debits": stats["debits"] or 0,
+        "unknown": stats["unknown"] or 0,
+    }
 
 
 if __name__ == "__main__":
