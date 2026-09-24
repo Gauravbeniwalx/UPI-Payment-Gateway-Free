@@ -18,70 +18,51 @@ from pydantic import BaseModel
 
 
 # ============================================================
-# HDFC BANK UPI / UTR VERIFIER
-# ------------------------------------------------------------
-# Flow:
-#   HDFC transaction email -> Gmail IMAP collector -> SQLite
-#   -> /verify-utr API
-#
-# QR:
-#   Dynamic UPI QR with NO fixed amount.
-#   Only UPI ID/payee are encoded.
-#
-# History:
-#   Last 10 days are scanned on startup and permanently kept
-#   in SQLite. Older records are not automatically deleted.
+# HDFC BANK UPI / UTR VERIFIER - FIXED VERSION
+# ============================================================
+# - Scans the last SEARCH_DAYS from Gmail on every startup.
+# - Uses Gmail All Mail when available, fallback to INBOX.
+# - Does NOT reject a transaction just because the HDFC wording
+#   says "debited". Direction is stored separately.
+# - Robustly parses HDFC "UPI transaction reference no." emails.
+# - Saves transactions with/without UTR for the payment dashboard.
+# - /verify-utr verifies only INCOMING/CREDIT transactions.
+# - /payment shows all transactions saved in SQLite.
+# - Keeps database history forever.
 # ============================================================
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ---------------- CONFIG ----------------
 
-GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+GMAIL_USER = os.getenv("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 
-UPI_ID = os.getenv("UPI_ID")
-PAYEE_NAME = os.getenv("PAYEE_NAME")
-BUSINESS_EMAIL = os.getenv("BUSINESS_EMAIL", GMAIL_USER or "")
+UPI_ID = os.getenv("UPI_ID", "")
+PAYEE_NAME = os.getenv("PAYEE_NAME", "")
+BUSINESS_EMAIL = os.getenv("BUSINESS_EMAIL", GMAIL_USER)
 
 DB_PATH = os.getenv("DB_PATH", "./hdfc_payments.db")
-
-# Required history window.
-SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "10"))
-
-# Gmail polling interval.
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3"))
-
-# Optional exact sender filter.
-# Example: alerts@hdfcbank.net
-# Leave empty to accept HDFC-domain senders and validate the email content.
+SEARCH_DAYS = max(1, int(os.getenv("SEARCH_DAYS", "10")))
+POLL_INTERVAL = max(3, int(os.getenv("POLL_INTERVAL", "5")))
 HDFC_EMAIL_FROM = os.getenv("HDFC_EMAIL_FROM", "").strip().lower()
 
-# If true, only credit/incoming transaction emails are stored.
-CREDIT_ONLY = os.getenv("CREDIT_ONLY", "true").lower() in {
+# If true, verification requires an incoming/credit transaction.
+# This is safer for a payment-verification service.
+VERIFY_INCOMING_ONLY = os.getenv("VERIFY_INCOMING_ONLY", "true").lower() in {
     "1", "true", "yes", "on"
 }
 
-# Never automatically delete transaction history.
-KEEP_HISTORY_FOREVER = True
-
-
 if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-    raise RuntimeError(
-        "Missing GMAIL_USER or GMAIL_APP_PASSWORD environment variables"
-    )
+    raise RuntimeError("Missing GMAIL_USER or GMAIL_APP_PASSWORD")
 
 if not UPI_ID or "@" not in UPI_ID:
-    raise RuntimeError("UPI_ID must contain a valid UPI ID such as name@bank")
+    raise RuntimeError("UPI_ID must contain a valid UPI ID")
 
 if not PAYEE_NAME.strip():
     raise RuntimeError("PAYEE_NAME cannot be empty")
 
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+# ---------------- GLOBAL STATE ----------------
 
 collector_running = False
 collector_started_at = None
@@ -91,15 +72,15 @@ collector_last_error = None
 collector_last_uid = 0
 collector_total_scanned = 0
 collector_total_saved = 0
+collector_total_rejected = 0
+collector_mailbox = ""
 
 collector_thread = None
 collector_stop_event = threading.Event()
 collector_lock = threading.Lock()
 
 
-# ============================================================
-# TIME HELPERS
-# ============================================================
+# ---------------- TIME ----------------
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -112,7 +93,6 @@ def iso_now():
 def parse_email_date(value):
     if not value:
         return iso_now()
-
     try:
         dt = email.utils.parsedate_to_datetime(value)
         if dt.tzinfo is None:
@@ -122,19 +102,23 @@ def parse_email_date(value):
         return iso_now()
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+# ---------------- DATABASE ----------------
+
+def table_columns(conn, table):
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row[1] for row in rows}
+
 
 def init_db():
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email_uid INTEGER UNIQUE,
+                email_uid INTEGER,
                 message_id TEXT,
                 utr TEXT,
                 amount REAL,
@@ -144,9 +128,22 @@ def init_db():
                 sender_email TEXT,
                 received_at TEXT,
                 cached_at TEXT NOT NULL,
-                raw_source TEXT DEFAULT 'HDFC_BANK_EMAIL'
+                raw_source TEXT DEFAULT 'HDFC_BANK_EMAIL',
+                direction TEXT DEFAULT 'UNKNOWN',
+                is_verified INTEGER DEFAULT 0
             )
         """)
+
+        cols = table_columns(conn, "payments")
+
+        # Migration for the previous database schema.
+        migrations = {
+            "direction": "ALTER TABLE payments ADD COLUMN direction TEXT DEFAULT 'UNKNOWN'",
+            "is_verified": "ALTER TABLE payments ADD COLUMN is_verified INTEGER DEFAULT 0",
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                conn.execute(sql)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS collector_state (
@@ -159,15 +156,17 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_payments_utr
             ON payments(utr)
         """)
-
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_payments_received
             ON payments(received_at)
         """)
-
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_payments_message_id
             ON payments(message_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_payments_direction
+            ON payments(direction)
         """)
 
         conn.commit()
@@ -180,6 +179,7 @@ init_db()
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
     finally:
@@ -215,19 +215,11 @@ def save_payment(
     note,
     subject,
     sender_email,
-    received_at
+    received_at,
+    direction
 ):
     with get_db() as conn:
-        # UID is the strongest duplicate key for one Gmail mailbox.
-        if email_uid is not None:
-            existing = conn.execute(
-                "SELECT id FROM payments WHERE email_uid = ? LIMIT 1",
-                (email_uid,)
-            ).fetchone()
-            if existing:
-                return False
-
-        # Message-ID protects against a repeated scan.
+        # Message-ID is the best cross-scan duplicate protection.
         if message_id:
             existing = conn.execute(
                 "SELECT id FROM payments WHERE message_id = ? LIMIT 1",
@@ -236,6 +228,17 @@ def save_payment(
             if existing:
                 return False
 
+        # Gmail UID is useful inside the same mailbox.
+        if email_uid is not None:
+            existing = conn.execute(
+                "SELECT id FROM payments WHERE email_uid = ? LIMIT 1",
+                (email_uid,)
+            ).fetchone()
+            if existing:
+                return False
+
+        # Do not discard an otherwise valid transaction merely because
+        # UTR parsing failed. It remains visible in /payment.
         conn.execute("""
             INSERT INTO payments (
                 email_uid,
@@ -248,12 +251,14 @@ def save_payment(
                 sender_email,
                 received_at,
                 cached_at,
-                raw_source
+                raw_source,
+                direction,
+                is_verified
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'HDFC_BANK_EMAIL')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'HDFC_BANK_EMAIL', ?, 0)
         """, (
             email_uid,
-            message_id,
+            message_id or None,
             utr,
             amount,
             sender_name,
@@ -261,15 +266,14 @@ def save_payment(
             subject,
             sender_email,
             received_at,
-            iso_now()
+            iso_now(),
+            direction
         ))
         conn.commit()
         return True
 
 
-# ============================================================
-# EMAIL COLLECTOR
-# ============================================================
+# ---------------- EMAIL COLLECTOR ----------------
 
 class HDFCBankEmailCollector:
 
@@ -277,6 +281,7 @@ class HDFCBankEmailCollector:
         self.gmail_user = gmail_user
         self.app_password = app_password
         self.mail = None
+        self.mailbox = None
 
     def connect(self):
         self.disconnect()
@@ -284,15 +289,30 @@ class HDFCBankEmailCollector:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         mail.login(self.gmail_user, self.app_password)
 
-        status, _ = mail.select("INBOX")
-        if status != "OK":
+        # Prefer Gmail All Mail so archived transaction emails are also found.
+        selected = None
+        for mailbox in ("[Gmail]/All Mail", "All Mail", "INBOX"):
+            try:
+                status, _ = mail.select(mailbox)
+                if status == "OK":
+                    selected = mailbox
+                    break
+            except Exception:
+                continue
+
+        if not selected:
             try:
                 mail.logout()
             except Exception:
                 pass
-            raise RuntimeError("Could not select Gmail INBOX")
+            raise RuntimeError("Could not select Gmail All Mail/INBOX")
 
         self.mail = mail
+        self.mailbox = selected
+
+        global collector_mailbox
+        collector_mailbox = selected
+
         return mail
 
     def disconnect(self):
@@ -301,13 +321,12 @@ class HDFCBankEmailCollector:
                 self.mail.close()
             except Exception:
                 pass
-
             try:
                 self.mail.logout()
             except Exception:
                 pass
-
         self.mail = None
+        self.mailbox = None
 
     def ensure_connection(self):
         if self.mail is None:
@@ -325,22 +344,16 @@ class HDFCBankEmailCollector:
     def decode_header_value(value):
         if not value:
             return ""
-
         try:
-            parts = decode_header(value)
             result = []
-
-            for part, encoding in parts:
+            for part, encoding in decode_header(value):
                 if isinstance(part, bytes):
-                    result.append(
-                        part.decode(
-                            encoding or "utf-8",
-                            errors="ignore"
-                        )
-                    )
+                    result.append(part.decode(
+                        encoding or "utf-8",
+                        errors="ignore"
+                    ))
                 else:
                     result.append(str(part))
-
             return "".join(result)
         except Exception:
             return str(value)
@@ -352,10 +365,7 @@ class HDFCBankEmailCollector:
 
         if msg.is_multipart():
             for part in msg.walk():
-                content_type = (
-                    part.get_content_type() or ""
-                ).lower()
-
+                content_type = (part.get_content_type() or "").lower()
                 disposition = str(
                     part.get("Content-Disposition") or ""
                 ).lower()
@@ -371,14 +381,8 @@ class HDFCBankEmailCollector:
                     if not payload:
                         continue
 
-                    charset = (
-                        part.get_content_charset() or "utf-8"
-                    )
-
-                    decoded = payload.decode(
-                        charset,
-                        errors="ignore"
-                    )
+                    charset = part.get_content_charset() or "utf-8"
+                    decoded = payload.decode(charset, errors="ignore")
 
                     if content_type == "text/plain":
                         text_parts.append(decoded)
@@ -390,14 +394,8 @@ class HDFCBankEmailCollector:
             try:
                 payload = msg.get_payload(decode=True)
                 if payload:
-                    charset = (
-                        msg.get_content_charset() or "utf-8"
-                    )
-                    decoded = payload.decode(
-                        charset,
-                        errors="ignore"
-                    )
-
+                    charset = msg.get_content_charset() or "utf-8"
+                    decoded = payload.decode(charset, errors="ignore")
                     if msg.get_content_type() == "text/html":
                         html_parts.append(decoded)
                     else:
@@ -410,18 +408,8 @@ class HDFCBankEmailCollector:
 
         if html_parts:
             html = "\n".join(html_parts)
-            html = re.sub(
-                r"<br\s*/?>",
-                "\n",
-                html,
-                flags=re.IGNORECASE
-            )
-            html = re.sub(
-                r"</p\s*>",
-                "\n",
-                html,
-                flags=re.IGNORECASE
-            )
+            html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+            html = re.sub(r"</p\s*>", "\n", html, flags=re.I)
             html = re.sub(r"<[^>]+>", " ", html)
             html = re.sub(r"\s+", " ", html)
             return html.strip()
@@ -432,8 +420,8 @@ class HDFCBankEmailCollector:
     def clean_text(text):
         text = text or ""
         text = text.replace("\xa0", " ")
-        text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\r\n?", "\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
         return text.strip()
 
     @staticmethod
@@ -443,49 +431,11 @@ class HDFCBankEmailCollector:
         if HDFC_EMAIL_FROM:
             return HDFC_EMAIL_FROM in sender
 
-        # HDFC commonly uses hdfcbank.net / hdfc.bank.in domains.
-        # We deliberately require a HDFC domain rather than trusting
-        # a subject line containing the word HDFC.
         return (
             "@hdfcbank.net" in sender
             or "@hdfc.bank.in" in sender
             or "@hdfcbank.com" in sender
         )
-
-    @staticmethod
-    def looks_like_credit(body, subject):
-        combined = f"{subject} {body}".lower()
-
-        positive = (
-            "credited",
-            "credit",
-            "received",
-            "upi payment received",
-            "amount credited",
-            "a/c credited",
-            "ac credited",
-            "account credited",
-        )
-
-        negative = (
-            "debited",
-            "debit",
-            "withdrawn",
-            "payment made",
-            "paid from",
-            "a/c debited",
-            "ac debited",
-        )
-
-        if any(x in combined for x in positive):
-            return True
-
-        if any(x in combined for x in negative):
-            return False
-
-        # If CREDIT_ONLY is enabled and the email does not explicitly
-        # identify credit/debit, do not trust it as a credit.
-        return not CREDIT_ONLY
 
     @classmethod
     def is_transaction_email(cls, sender, subject, body):
@@ -499,11 +449,14 @@ class HDFCBankEmailCollector:
             "transaction",
             "credited",
             "credit",
+            "debited",
+            "debit",
             "utr",
             "reference",
             "ref no",
             "payment",
             "amount",
+            "vpa",
         )
 
         return any(word in combined for word in transaction_words)
@@ -511,16 +464,19 @@ class HDFCBankEmailCollector:
     @staticmethod
     def parse_amount(text):
         patterns = [
-            # INR 1,234.56 / Rs. 1234 / ₹1234
+            # Exact format from supplied HDFC email:
+            # Rs.1.00 is debited...
             r"(?:INR|Rs\.?|₹)\s*([\d,]+(?:\.\d{1,2})?)",
+
             r"([\d,]+(?:\.\d{1,2})?)\s*(?:INR|Rs\.?|₹)",
-            # Amount: 1,234.56 / Amount INR 1234
-            r"(?:amount|amount credited|credit amount|transaction amount)"
-            r"[^0-9]{0,30}([\d,]+(?:\.\d{1,2})?)",
+
+            r"(?:amount|amount credited|amount debited|"
+            r"credit amount|debit amount|transaction amount)"
+            r"[^0-9]{0,40}([\d,]+(?:\.\d{1,2})?)",
         ]
 
         for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
+            m = re.search(pattern, text, re.I)
             if m:
                 try:
                     value = float(m.group(1).replace(",", ""))
@@ -533,32 +489,37 @@ class HDFCBankEmailCollector:
 
     @staticmethod
     def parse_utr(text):
-        # Most useful: label + reference value.
+        # Handles:
+        # UPI transaction reference no.: 005228497617
+        # UPI transaction reference number: XXXXX
+        # UPI REF NO: XXXXX
+        # UTR: XXXXX
+        # Transaction reference: XXXXX
+        # Reference no.: XXXXX
         labelled_patterns = [
-            r"(?:UPI\s*(?:REF|REFERENCE)|UTR|"
-            r"TRANSACTION\s*(?:ID|REFERENCE|REF)|"
-            r"REFERENCE\s*(?:NO|NUMBER|ID)?|REF\s*(?:NO|NUMBER|ID))"
-            r"\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
-
-            r"(?:UPI\s*ID|TRANSACTION\s*ID)"
-            r"\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"UPI\s+TRANSACTION\s+REFERENCE\s+(?:NO|NUMBER)\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"UPI\s+TRANSACTION\s+REF(?:ERENCE)?\.?\s*(?:NO|NUMBER)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"UPI\s*(?:REF|REFERENCE)\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"TRANSACTION\s*(?:ID|REFERENCE|REF)\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"\bUTR\b\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"\bREFERENCE\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
+            r"\bREF\s*(?:NO|NUMBER|ID)?\.?\s*[:#=\-]?\s*([A-Z0-9]{8,30})",
         ]
 
         for pattern in labelled_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for candidate in matches:
-                candidate = candidate.strip().upper()
-                # Avoid obvious non-reference values.
+            for candidate in re.findall(pattern, text, re.I):
+                candidate = candidate.strip().upper().rstrip(".")
                 if candidate in {
-                    "NUMBER", "REFERENCE", "TRANSACTION", "PAYMENT"
+                    "NUMBER", "REFERENCE", "TRANSACTION",
+                    "PAYMENT", "NO", "ID"
                 }:
                     continue
-                if len(candidate) >= 8:
+                if 8 <= len(candidate) <= 30:
                     return candidate
 
-        # UPI bank references are often 12-digit numeric strings.
-        if re.search(r"\bUPI\b", text, re.IGNORECASE):
-            numeric = re.findall(r"\b\d{12,18}\b", text)
+        # Fallback for common numeric UPI references.
+        if re.search(r"\bUPI\b", text, re.I):
+            numeric = re.findall(r"\b\d{10,18}\b", text)
             if numeric:
                 return numeric[0]
 
@@ -566,23 +527,24 @@ class HDFCBankEmailCollector:
 
     @staticmethod
     def parse_sender_name(text):
+        # Supplied format:
+        # towards VPA beniwalgaurav@fam (Gaurav Beniwal)
         patterns = [
+            r"\bVPA\s+[^\s()]+?\s*\(([^)]+)\)",
+            r"(?:paid\s+by|received\s+from)\s*[:\-]?\s*([A-Za-z][A-Za-z .&'_-]{1,80})",
             r"(?:from|by|sender|payer|remitter|received\s+from)"
             r"\s*[:\-]\s*([A-Za-z][A-Za-z .&'_-]{1,80})",
-
-            r"(?:paid\s+by|received\s+from)"
-            r"\s+([A-Za-z][A-Za-z .&'_-]{1,80})",
         ]
 
         for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
+            m = re.search(pattern, text, re.I)
             if m:
                 candidate = m.group(1).strip()
                 candidate = re.split(
                     r"\s+(?:via|on|using|through|for|ref|utr)\b",
                     candidate,
                     maxsplit=1,
-                    flags=re.IGNORECASE
+                    flags=re.I
                 )[0].strip()
 
                 if 2 <= len(candidate) <= 80:
@@ -600,11 +562,42 @@ class HDFCBankEmailCollector:
         ]
 
         for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
+            m = re.search(pattern, text, re.I)
             if m:
                 return m.group(1).strip()[:120]
 
         return None
+
+    @staticmethod
+    def parse_direction(text):
+        t = text.lower()
+
+        # More specific phrases first.
+        if re.search(r"\b(?:is|has been|was)\s+credited\b", t):
+            return "CREDIT"
+
+        if re.search(r"\b(?:is|has been|was)\s+debited\b", t):
+            return "DEBIT"
+
+        if any(x in t for x in (
+            "amount credited",
+            "account credited",
+            "a/c credited",
+            "ac credited",
+            "upi payment received",
+            "payment received",
+        )):
+            return "CREDIT"
+
+        if any(x in t for x in (
+            "amount debited",
+            "account debited",
+            "a/c debited",
+            "ac debited",
+        )):
+            return "DEBIT"
+
+        return "UNKNOWN"
 
     @classmethod
     def parse_payment(cls, body, subject=""):
@@ -615,6 +608,7 @@ class HDFCBankEmailCollector:
             "utr": cls.parse_utr(normalized),
             "sender_name": cls.parse_sender_name(normalized),
             "note": cls.parse_note(normalized),
+            "direction": cls.parse_direction(normalized),
         }
 
     def fetch_message(self, uid):
@@ -639,44 +633,30 @@ class HDFCBankEmailCollector:
         return email.message_from_bytes(raw)
 
     def process_uid(self, uid):
+        global collector_total_rejected
+
         try:
             msg = self.fetch_message(uid)
             if not msg:
+                collector_total_rejected += 1
                 return False
 
-            sender = self.decode_header_value(
-                msg.get("From") or ""
-            )
-            subject = self.decode_header_value(
-                msg.get("Subject") or ""
-            )
+            sender = self.decode_header_value(msg.get("From") or "")
+            subject = self.decode_header_value(msg.get("Subject") or "")
             body = self.extract_body(msg)
 
-            if not self.is_transaction_email(
-                sender,
-                subject,
-                body
-            ):
-                return False
-
-            if not self.looks_like_credit(body, subject):
+            if not self.is_transaction_email(sender, subject, body):
+                collector_total_rejected += 1
                 return False
 
             parsed = self.parse_payment(body, subject)
 
-            # UTR is the critical field for this service.
-            if not parsed["utr"]:
-                return False
+            # Save every HDFC transaction email even if one optional field
+            # failed to parse. This makes /payment useful for diagnostics.
+            message_id = (msg.get("Message-ID") or "").strip()
+            received_at = parse_email_date(msg.get("Date"))
 
-            message_id = (
-                msg.get("Message-ID") or ""
-            ).strip()
-
-            received_at = parse_email_date(
-                msg.get("Date")
-            )
-
-            return save_payment(
+            saved = save_payment(
                 email_uid=uid,
                 message_id=message_id,
                 utr=parsed["utr"],
@@ -685,14 +665,34 @@ class HDFCBankEmailCollector:
                 note=parsed["note"],
                 subject=subject,
                 sender_email=sender,
-                received_at=received_at
+                received_at=received_at,
+                direction=parsed["direction"]
             )
 
+            return saved
+
         except Exception as exc:
-            print(
-                f"[Collector] UID {uid} error: {exc}"
-            )
+            print(f"[Collector] UID {uid} error: {exc}")
+            collector_total_rejected += 1
             return False
+
+    def search_since(self):
+        # Add one calendar day to avoid boundary misses.
+        since_date = (
+            datetime.now() - timedelta(days=SEARCH_DAYS + 1)
+        ).strftime("%d-%b-%Y")
+
+        if HDFC_EMAIL_FROM:
+            query = f'(FROM "{HDFC_EMAIL_FROM}" SINCE "{since_date}")'
+        else:
+            query = f'(SINCE "{since_date}")'
+
+        status, data = self.mail.search(None, query)
+
+        if status != "OK":
+            raise RuntimeError("Gmail history search failed")
+
+        return data[0].split()
 
     def initial_backfill(self):
         global collector_last_uid
@@ -701,37 +701,14 @@ class HDFCBankEmailCollector:
 
         self.ensure_connection()
 
-        # Gmail SINCE is date based. Use one extra day to avoid timezone
-        # boundary surprises; the API itself returns the stored records.
-        since = (
-            datetime.now() -
-            timedelta(days=SEARCH_DAYS)
-        ).strftime("%d-%b-%Y")
-
-        if HDFC_EMAIL_FROM:
-            search_query = (
-                f'(FROM "{HDFC_EMAIL_FROM}" '
-                f'SINCE "{since}")'
-            )
-        else:
-            search_query = f'(SINCE "{since}")'
-
-        status, data = self.mail.search(
-            None,
-            search_query
-        )
-
-        if status != "OK":
-            raise RuntimeError(
-                "Gmail history search failed"
-            )
-
-        email_ids = data[0].split()
-        highest_uid = 0
+        email_ids = self.search_since()
 
         print(
-            f"[Collector] 10-day scan: {len(email_ids)} emails found"
+            f"[Collector] Backfill: {len(email_ids)} emails found "
+            f"in {self.mailbox}"
         )
+
+        highest_uid = 0
 
         for raw_uid in email_ids:
             try:
@@ -751,7 +728,7 @@ class HDFCBankEmailCollector:
 
         print(
             f"[Collector] Backfill complete. "
-            f"Stored payments: {self.get_payment_count()}"
+            f"DB payments: {self.get_payment_count()}"
         )
 
     def fetch_new_emails(self):
@@ -762,9 +739,7 @@ class HDFCBankEmailCollector:
         self.ensure_connection()
 
         try:
-            last_uid = int(
-                get_state("last_uid", "0")
-            )
+            last_uid = int(get_state("last_uid", "0"))
         except Exception:
             last_uid = 0
 
@@ -775,11 +750,10 @@ class HDFCBankEmailCollector:
         )
 
         if status != "OK":
-            raise RuntimeError(
-                "Gmail incremental search failed"
-            )
+            raise RuntimeError("Gmail incremental search failed")
 
         uid_list = data[0].split()
+
         if not uid_list:
             return 0
 
@@ -816,9 +790,7 @@ class HDFCBankEmailCollector:
             return int(row["count"])
 
 
-# ============================================================
-# COLLECTOR WORKER
-# ============================================================
+# ---------------- COLLECTOR WORKER ----------------
 
 collector = HDFCBankEmailCollector(
     GMAIL_USER,
@@ -836,17 +808,15 @@ def collector_worker():
     collector_running = True
     collector_started_at = iso_now()
 
-    print("=" * 64)
-    print("HDFC BANK UPI / UTR VERIFIER")
-    print("=" * 64)
+    print("=" * 70)
+    print("HDFC BANK UPI / UTR VERIFIER - FIXED")
+    print("=" * 70)
 
     try:
-        # First boot/restart: recover the last 10 days.
         collector.initial_backfill()
 
         print(
-            f"[Collector] Live monitoring every "
-            f"{POLL_INTERVAL} seconds"
+            f"[Collector] Live monitoring every {POLL_INTERVAL} seconds"
         )
 
         while not collector_stop_event.is_set():
@@ -857,14 +827,11 @@ def collector_worker():
                 collector_last_success = iso_now()
                 collector_last_error = None
                 collector_last_check = iso_now()
+
             except Exception as exc:
                 collector_last_error = str(exc)
                 collector_last_check = iso_now()
-
-                print(
-                    "[Collector] Cycle error:",
-                    str(exc)
-                )
+                print("[Collector] Cycle error:", str(exc))
 
                 try:
                     collector.disconnect()
@@ -872,11 +839,7 @@ def collector_worker():
                     pass
 
             elapsed = time.time() - started
-            sleep_for = max(
-                0,
-                POLL_INTERVAL - elapsed
-            )
-
+            sleep_for = max(0, POLL_INTERVAL - elapsed)
             collector_stop_event.wait(sleep_for)
 
     except Exception as exc:
@@ -885,26 +848,19 @@ def collector_worker():
 
     finally:
         collector_running = False
-
         try:
             collector.disconnect()
         except Exception:
             pass
-
         print("[Collector] Worker stopped")
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
+# ---------------- FASTAPI ----------------
 
 app = FastAPI(
     title="HDFC Bank UPI UTR Verification API",
-    version="1.0.0",
-    description=(
-        "UPI QR + HDFC Bank email based UTR verification. "
-        "No fixed amount is embedded in the QR."
-    )
+    version="2.0.0",
+    description="HDFC email based UPI transaction collector and UTR verifier."
 )
 
 
@@ -919,7 +875,6 @@ async def startup_event():
         daemon=True,
         name="HDFCBankPaymentCollector"
     )
-
     collector_thread.start()
 
     print("[System] HDFC collector started")
@@ -928,21 +883,15 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     collector_stop_event.set()
-
     try:
         collector.disconnect()
     except Exception:
         pass
 
 
-# ============================================================
-# QR HELPERS
-# ============================================================
+# ---------------- QR ----------------
 
 def make_upi_url():
-    # IMPORTANT:
-    # No 'am=' parameter is added.
-    # Therefore the payer enters/selects the amount in the UPI app.
     params = {
         "pa": UPI_ID,
         "pn": PAYEE_NAME,
@@ -976,10 +925,6 @@ def make_qr_png():
     return buffer.getvalue()
 
 
-# ============================================================
-# PROFESSIONAL QR PAGE
-# ============================================================
-
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return RedirectResponse("/qr", status_code=302)
@@ -990,16 +935,12 @@ async def qr_png():
     return Response(
         content=make_qr_png(),
         media_type="image/png",
-        headers={
-            "Cache-Control": "no-store, max-age=0"
-        }
+        headers={"Cache-Control": "no-store, max-age=0"}
     )
 
 
 @app.get("/qr", response_class=HTMLResponse)
 async def qr_page():
-    # Keep the public page intentionally minimal:
-    # business name + QR + email only.
     safe_name = (
         PAYEE_NAME
         .replace("&", "&amp;")
@@ -1019,146 +960,52 @@ async def qr_page():
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport"
-          content="width=device-width,initial-scale=1">
-
-    <meta name="robots" content="noindex,nofollow">
-    <meta name="theme-color" content="#0b1220">
-
-    <title>{safe_name} • UPI Payment</title>
-
-    <style>
-        * {{
-            box-sizing: border-box;
-        }}
-
-        html, body {{
-            min-height: 100%;
-            margin: 0;
-        }}
-
-        body {{
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 24px;
-
-            font-family:
-                Inter,
-                ui-sans-serif,
-                system-ui,
-                -apple-system,
-                BlinkMacSystemFont,
-                "Segoe UI",
-                sans-serif;
-
-            background:
-                radial-gradient(
-                    circle at top,
-                    #eef4ff 0,
-                    #f7f9fc 38%,
-                    #eef1f6 100%
-                );
-
-            color: #111827;
-        }}
-
-        .card {{
-            width: min(430px, 100%);
-            background: rgba(255,255,255,.96);
-            border: 1px solid rgba(15,23,42,.08);
-            border-radius: 28px;
-            padding: 30px 24px 26px;
-            text-align: center;
-
-            box-shadow:
-                0 22px 70px rgba(15,23,42,.12);
-        }}
-
-        .brand {{
-            font-size: 22px;
-            font-weight: 750;
-            letter-spacing: -.02em;
-            margin-bottom: 5px;
-        }}
-
-        .label {{
-            font-size: 13px;
-            color: #667085;
-            margin-bottom: 22px;
-        }}
-
-        .qr-wrap {{
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-
-            padding: 15px;
-            background: #fff;
-            border-radius: 20px;
-            border: 1px solid #e5e7eb;
-
-            box-shadow:
-                0 10px 30px rgba(15,23,42,.08);
-        }}
-
-        .qr {{
-            display: block;
-            width: min(285px, 70vw);
-            height: auto;
-        }}
-
-        .email {{
-            margin-top: 22px;
-            font-size: 14px;
-            color: #475467;
-            word-break: break-word;
-        }}
-
-        .email strong {{
-            color: #111827;
-            font-weight: 650;
-        }}
-
-        .secure {{
-            margin-top: 14px;
-            font-size: 11px;
-            color: #98a2b3;
-        }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>{safe_name} • UPI Payment</title>
+<style>
+*{{box-sizing:border-box}}
+body{{
+margin:0;min-height:100vh;display:flex;align-items:center;
+justify-content:center;padding:24px;font-family:Inter,system-ui,sans-serif;
+background:radial-gradient(circle at top,#eef4ff,#f7f9fc 42%,#eef1f6);
+color:#111827
+}}
+.card{{
+width:min(430px,100%);background:rgba(255,255,255,.96);
+border:1px solid rgba(15,23,42,.08);border-radius:28px;
+padding:30px 24px 26px;text-align:center;
+box-shadow:0 22px 70px rgba(15,23,42,.12)
+}}
+.brand{{font-size:22px;font-weight:750;margin-bottom:5px}}
+.label{{font-size:13px;color:#667085;margin-bottom:22px}}
+.qr-wrap{{display:inline-flex;padding:15px;background:#fff;border-radius:20px;
+border:1px solid #e5e7eb;box-shadow:0 10px 30px rgba(15,23,42,.08)}}
+.qr{{display:block;width:min(285px,70vw);height:auto}}
+.email{{margin-top:22px;font-size:14px;color:#475467;word-break:break-word}}
+.email strong{{color:#111827}}
+.secure{{margin-top:14px;font-size:11px;color:#98a2b3}}
+.links{{margin-top:18px}}
+.links a{{text-decoration:none;color:#2563eb;font-size:13px}}
+</style>
 </head>
-
 <body>
-    <main class="card">
-        <div class="brand">{safe_name}</div>
-        <div class="label">Scan to pay via UPI</div>
-
-        <div class="qr-wrap">
-            <img
-                class="qr"
-                src="/qr.png"
-                alt="UPI payment QR code"
-                width="285"
-                height="285"
-            >
-        </div>
-
-        <div class="email">
-            <strong>{safe_email}</strong>
-        </div>
-
-        <div class="secure">
-            UPI payment • Amount entered by payer
-        </div>
-    </main>
+<main class="card">
+<div class="brand">{safe_name}</div>
+<div class="label">Scan to pay via UPI</div>
+<div class="qr-wrap">
+<img class="qr" src="/qr.png" alt="UPI payment QR code" width="285" height="285">
+</div>
+<div class="email"><strong>{safe_email}</strong></div>
+<div class="links"><a href="/payment">Payment History</a></div>
+<div class="secure">UPI payment • Amount entered by payer</div>
+</main>
 </body>
 </html>"""
 
 
-# ============================================================
-# UTR VERIFICATION API
-# ============================================================
+# ---------------- UTR VERIFICATION ----------------
 
 class VerifyUTRRequest(BaseModel):
     utr: str
@@ -1166,8 +1013,6 @@ class VerifyUTRRequest(BaseModel):
 
 def normalize_utr(value):
     value = (value or "").strip().upper()
-
-    # Remove spaces/hyphens users sometimes paste around a reference.
     value = re.sub(r"[\s\-]+", "", value)
 
     if not re.fullmatch(r"[A-Z0-9]{8,30}", value):
@@ -1188,6 +1033,7 @@ def payment_to_response(row):
         "sender_name": row["sender_name"],
         "note": row["note"],
         "received_at": row["received_at"],
+        "direction": row["direction"],
         "bank": "HDFC Bank",
         "source": "HDFC_BANK_EMAIL",
     }
@@ -1195,30 +1041,28 @@ def payment_to_response(row):
 
 @app.get("/verify-utr")
 async def verify_utr(utr: str):
-    """
-    Main verification API.
-
-    Example:
-      GET /verify-utr?utr=123456789012
-
-    Returns found=true only when the UTR exists in the
-    locally cached HDFC transaction emails.
-    """
     utr = normalize_utr(utr)
 
     with get_db() as conn:
-        row = conn.execute("""
-            SELECT
-                utr,
-                amount,
-                sender_name,
-                note,
-                received_at
-            FROM payments
-            WHERE utr = ?
-            ORDER BY received_at DESC
-            LIMIT 1
-        """, (utr,)).fetchone()
+        if VERIFY_INCOMING_ONLY:
+            row = conn.execute("""
+                SELECT utr, amount, sender_name, note,
+                       received_at, direction
+                FROM payments
+                WHERE utr = ?
+                  AND direction = 'CREDIT'
+                ORDER BY received_at DESC
+                LIMIT 1
+            """, (utr,)).fetchone()
+        else:
+            row = conn.execute("""
+                SELECT utr, amount, sender_name, note,
+                       received_at, direction
+                FROM payments
+                WHERE utr = ?
+                ORDER BY received_at DESC
+                LIMIT 1
+            """, (utr,)).fetchone()
 
     if not row:
         return {
@@ -1227,7 +1071,11 @@ async def verify_utr(utr: str):
             "utr": utr,
             "bank": "HDFC Bank",
             "source": "HDFC_BANK_EMAIL",
-            "message": "UTR not found in cached HDFC transaction emails",
+            "message": (
+                "UTR not found as an incoming HDFC payment"
+                if VERIFY_INCOMING_ONLY
+                else "UTR not found in cached HDFC transaction emails"
+            )
         }
 
     return payment_to_response(row)
@@ -1238,11 +1086,179 @@ async def verify_utr_post(req: VerifyUTRRequest):
     return await verify_utr(req.utr)
 
 
-# ============================================================
-# HEALTH / INTERNAL STATUS
-# ------------------------------------------------------------
-# These are operational endpoints, not payment APIs.
-# ============================================================
+# ---------------- PAYMENT DASHBOARD ----------------
+
+def esc(value):
+    value = "" if value is None else str(value)
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+@app.get("/payment", response_class=HTMLResponse)
+async def payment_page():
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT id, utr, amount, sender_name, note, subject,
+                   sender_email, received_at, direction, is_verified
+            FROM payments
+            ORDER BY datetime(received_at) DESC, id DESC
+        """).fetchall()
+
+        stats = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE
+                    WHEN direction = 'CREDIT' THEN amount ELSE 0 END), 0) AS credits,
+                COALESCE(SUM(CASE
+                    WHEN direction = 'DEBIT' THEN amount ELSE 0 END), 0) AS debits,
+                SUM(CASE WHEN utr IS NOT NULL AND utr != ''
+                    THEN 1 ELSE 0 END) AS utr_count
+            FROM payments
+        """).fetchone()
+
+    cards = []
+
+    for row in rows:
+        direction = row["direction"] or "UNKNOWN"
+        direction_class = direction.lower()
+
+        utr = esc(row["utr"] or "UTR not parsed")
+        amount = (
+            f"₹{float(row['amount']):,.2f}"
+            if row["amount"] is not None else "Amount unavailable"
+        )
+
+        sender = esc(row["sender_name"] or "Unknown")
+        note = esc(row["note"] or "")
+        received = esc(row["received_at"] or "")
+        subject = esc(row["subject"] or "")
+        sender_email = esc(row["sender_email"] or "")
+
+        cards.append(f"""
+        <article class="payment-card"
+                 data-search="{utr} {sender} {note} {subject} {sender_email}">
+            <div class="top">
+                <div>
+                    <div class="utr">{utr}</div>
+                    <div class="date">{received}</div>
+                </div>
+                <span class="badge {direction_class}">{esc(direction)}</span>
+            </div>
+            <div class="amount">{amount}</div>
+            <div class="meta">
+                <div><span>Sender</span><b>{sender}</b></div>
+                <div><span>Email</span><b>{sender_email}</b></div>
+                <div><span>Note</span><b>{note or "—"}</b></div>
+            </div>
+        </article>
+        """)
+
+    cards_html = "".join(cards)
+
+    safe_name = esc(PAYEE_NAME)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{safe_name} • Payment History</title>
+<style>
+*{{box-sizing:border-box}}
+body{{
+margin:0;min-height:100vh;font-family:Inter,system-ui,-apple-system,sans-serif;
+background:
+radial-gradient(circle at 10% 0%,rgba(59,130,246,.16),transparent 28%),
+radial-gradient(circle at 90% 10%,rgba(14,165,233,.12),transparent 25%),
+#f5f7fb;color:#111827
+}}
+.wrap{{width:min(1100px,94%);margin:30px auto 60px}}
+.header{{display:flex;justify-content:space-between;align-items:center;gap:15px;
+margin-bottom:20px;flex-wrap:wrap}}
+h1{{margin:0;font-size:28px;letter-spacing:-.03em}}
+.sub{{color:#667085;font-size:13px;margin-top:5px}}
+.back{{padding:11px 16px;border-radius:14px;text-decoration:none;color:#111827;
+background:rgba(255,255,255,.7);border:1px solid rgba(15,23,42,.08);
+backdrop-filter:blur(16px)}}
+.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}}
+.stat{{padding:18px;border-radius:22px;background:rgba(255,255,255,.72);
+border:1px solid rgba(255,255,255,.8);box-shadow:0 12px 35px rgba(15,23,42,.07);
+backdrop-filter:blur(18px)}}
+.stat span{{display:block;color:#667085;font-size:12px;margin-bottom:7px}}
+.stat b{{font-size:22px}}
+.search{{width:100%;padding:15px 18px;border:1px solid rgba(15,23,42,.08);
+border-radius:17px;background:rgba(255,255,255,.8);outline:none;font-size:15px;
+margin-bottom:18px}}
+.list{{display:grid;gap:12px}}
+.payment-card{{padding:20px;border-radius:24px;background:rgba(255,255,255,.76);
+border:1px solid rgba(255,255,255,.9);box-shadow:0 12px 35px rgba(15,23,42,.07);
+backdrop-filter:blur(18px)}}
+.top{{display:flex;justify-content:space-between;gap:15px;align-items:flex-start}}
+.utr{{font-weight:750;font-size:17px;word-break:break-all}}
+.date{{color:#667085;font-size:12px;margin-top:5px}}
+.badge{{padding:6px 10px;border-radius:999px;font-size:11px;font-weight:750}}
+.credit{{background:#dcfce7;color:#166534}}
+.debit{{background:#fee2e2;color:#991b1b}}
+.unknown{{background:#e5e7eb;color:#374151}}
+.amount{{font-size:28px;font-weight:800;margin:16px 0}}
+.meta{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}}
+.meta div{{padding:12px;border-radius:15px;background:rgba(248,250,252,.8)}}
+.meta span{{display:block;color:#98a2b3;font-size:11px;margin-bottom:4px}}
+.meta b{{font-size:13px;word-break:break-word}}
+.empty{{padding:50px;text-align:center;color:#667085}}
+@media(max-width:700px){{
+.stats{{grid-template-columns:repeat(2,1fr)}}
+.meta{{grid-template-columns:1fr}}
+h1{{font-size:23px}}
+}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="header">
+<div>
+<h1>Payment History</h1>
+<div class="sub">{safe_name} • All transactions saved in SQLite</div>
+</div>
+<a class="back" href="/qr">← QR</a>
+</div>
+
+<div class="stats">
+<div class="stat"><span>Total Records</span><b>{int(stats["total"] or 0)}</b></div>
+<div class="stat"><span>Credits</span><b>₹{float(stats["credits"] or 0):,.2f}</b></div>
+<div class="stat"><span>Debits</span><b>₹{float(stats["debits"] or 0):,.2f}</b></div>
+<div class="stat"><span>UTRs Saved</span><b>{int(stats["utr_count"] or 0)}</b></div>
+</div>
+
+<input id="search" class="search"
+       placeholder="Search UTR, sender, email, note..."
+       autocomplete="off">
+
+<div id="list" class="list">
+{cards_html if cards_html else '<div class="empty">No payments saved yet.</div>'}
+</div>
+</div>
+
+<script>
+const input=document.getElementById('search');
+const cards=[...document.querySelectorAll('.payment-card')];
+input.addEventListener('input',()=>{
+ const q=input.value.toLowerCase().trim();
+ cards.forEach(card=>{
+   card.style.display=card.dataset.search.toLowerCase().includes(q)?'':'none';
+ });
+});
+</script>
+</body>
+</html>"""
+
+
+# ---------------- HEALTH / STATUS ----------------
 
 @app.get("/health")
 async def health():
@@ -1258,16 +1274,21 @@ async def health():
         "stored_payments": row["count"],
         "history_scan_days": SEARCH_DAYS,
         "poll_interval_seconds": POLL_INTERVAL,
-        "upi_id": UPI_ID,
+        "mailbox": collector_mailbox,
+        "db_path": DB_PATH,
     }
 
 
 @app.get("/collector/status")
 async def collector_status():
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS count FROM payments"
-        ).fetchone()
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS count,
+                SUM(CASE WHEN direction='CREDIT' THEN 1 ELSE 0 END) AS credits,
+                SUM(CASE WHEN direction='DEBIT' THEN 1 ELSE 0 END) AS debits
+            FROM payments
+        """).fetchone()
 
     return {
         "running": collector_running,
@@ -1278,9 +1299,13 @@ async def collector_status():
         "last_uid": collector_last_uid,
         "total_scanned": collector_total_scanned,
         "total_saved": collector_total_saved,
+        "total_rejected": collector_total_rejected,
         "stored_payments": row["count"],
+        "credit_records": row["credits"] or 0,
+        "debit_records": row["debits"] or 0,
         "history_scan_days": SEARCH_DAYS,
         "poll_interval_seconds": POLL_INTERVAL,
+        "mailbox": collector_mailbox,
         "history_retention": "forever",
     }
 
@@ -1301,9 +1326,7 @@ async def collector_refresh():
         }
 
 
-# ============================================================
-# RUN DIRECTLY
-# ============================================================
+# ---------------- RUN DIRECTLY ----------------
 
 if __name__ == "__main__":
     import uvicorn
