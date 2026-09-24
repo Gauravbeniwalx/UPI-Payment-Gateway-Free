@@ -7,3 +7,4 @@ start command - Python hdfc_upi_verifier.py
 environment variables :
 GMAIL_USER - gmail 
 GMAIL_APP_PASSWORD - app password
+PYTHON_VERSION=3.11.11
